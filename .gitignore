@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Streamlit secrets (local only)
+.streamlit/secrets.toml
+
+# Google service account keys (never commit!)
+*.json
+
+# OS files
+.DS_Store
+Thumbs.db

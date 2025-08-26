@@ -13,12 +13,7 @@ from googleapiclient.discovery import build
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-
-if "GOOGLE_APPLICATION_CREDENTIALS_JSON" in st.secrets:
-    creds_dict = json.loads(st.secrets["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
-    SERVICE_ACCOUNT_FILE = service_account.Credentials.from_service_account_info(creds_dict)
-else:
-    SERVICE_ACCOUNT_FILE = service_account.Credentials.from_service_account_file("turing-genai-ws-58339643dd3f.json")
+#SERVICE_ACCOUNT_FILE = "turing-genai-ws-58339643dd3f.json" 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STYLES
@@ -61,10 +56,15 @@ label, .stRadio label, .stSelectbox label, .stNumberInput label { font-weight: 6
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def authenticate_drive():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=SCOPES,
-    )
+    # Prefer cloud secrets; fall back to local file only when running locally
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        # Local dev fallback (put your JSON in .streamlit/secrets.toml or keep a local file)
+        SERVICE_ACCOUNT_FILE = "turing-genai-ws-58339643dd3f.json"
+        creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+
     return build("drive", "v3", credentials=creds)
 
 def list_drive_images_recursive(service, parent_id: str, current_path=None, results=None) -> List[Dict]:
@@ -79,7 +79,13 @@ def list_drive_images_recursive(service, parent_id: str, current_path=None, resu
     while True:
         resp = (
             service.files()
-            .list(q=query, fields="nextPageToken, files(id, name, mimeType)", pageToken=page_token)
+            .list(
+                q=query,
+                fields="nextPageToken, files(id, name, mimeType)",
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
             .execute()
         )
         files = resp.get("files", [])
