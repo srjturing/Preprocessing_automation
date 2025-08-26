@@ -13,7 +13,7 @@ from googleapiclient.discovery import build
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-#SERVICE_ACCOUNT_FILE = "turing-genai-ws-58339643dd3f.json" 
+# SERVICE_ACCOUNT_FILE = "turing-genai-ws-58339643dd3f.json"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STYLES
@@ -54,17 +54,18 @@ label, .stRadio label, .stSelectbox label, .stNumberInput label { font-weight: 6
 # ─────────────────────────────────────────────────────────────────────────────
 # GOOGLE DRIVE HELPERS (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
+
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
 @st.cache_resource
 def authenticate_drive():
-    # Prefer cloud secrets; fall back to local file only when running locally
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     else:
-        # Local dev fallback (put your JSON in .streamlit/secrets.toml or keep a local file)
-        SERVICE_ACCOUNT_FILE = "turing-genai-ws-58339643dd3f.json"
+        # local fallback ONLY for dev (keep file out of git)
+        SERVICE_ACCOUNT_FILE = "turing-genai-ws-*.json"
         creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-
     return build("drive", "v3", credentials=creds)
 
 def list_drive_images_recursive(service, parent_id: str, current_path=None, results=None) -> List[Dict]:
@@ -232,6 +233,146 @@ def build_json_dataframe(uploaded_json_file) -> Tuple[pd.DataFrame, List[str]]:
     df = pd.DataFrame(rows)
     available_fields = list(df.columns)
     return df, available_fields
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTI-IMAGE HELPERS (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.jfif', '.heic', '.svg']
+
+def _has_image_ext(name: str) -> bool:
+    name = (name or "").strip().lower()
+    return any(name.endswith(ext) for ext in IMAGE_EXTENSIONS)
+
+@st.cache_resource
+def _drive_service_cached():
+    # Use same auth path as elsewhere, but cache the built service for speed.
+    return authenticate_drive()
+
+@st.cache_data(show_spinner=False)
+def mi_get_folder_name(folder_id: str) -> str:
+    """Name lookup with its own tiny cache via st.cache_data."""
+    svc = _drive_service_cached()
+    try:
+        meta = svc.files().get(
+            fileId=folder_id,
+            fields="id,name",
+            supportsAllDrives=True
+        ).execute()
+        return meta.get("name", "")
+    except Exception:
+        return ""
+
+@st.cache_data(show_spinner=False)
+def mi_get_folder_details(folder_id: str) -> Dict[str, str]:
+    """Return {name, parent} for a folder id."""
+    svc = _drive_service_cached()
+    try:
+        meta = svc.files().get(
+            fileId=folder_id,
+            fields="id,name,parents",
+            supportsAllDrives=True
+        ).execute()
+        return {
+            "name": meta.get("name", "Unknown"),
+            "parent": (meta.get("parents", [None]) or [None])[0]
+        }
+    except Exception:
+        return {"name": "Unknown", "parent": None}
+
+@st.cache_data(show_spinner=False)
+def mi_build_complete_path(folder_id: str) -> str:
+    """Build folder path from topmost parent to this folder."""
+    parts, cur, seen = [], folder_id, set()
+    while cur and cur not in seen:
+        seen.add(cur)
+        d = mi_get_folder_details(cur)
+        if d["name"] and d["name"] != "Unknown":
+            parts.insert(0, d["name"])
+        cur = d["parent"]
+        if not cur:
+            break
+    return "/".join(parts)
+
+def _last_number(s: str) -> int:
+    """Extract last integer in a string for natural page sorting; inf if none."""
+    m = re.search(r'(\d+)(?!.*\d)', s or "")
+    return int(m.group(1)) if m else 10**9
+
+@st.cache_data(show_spinner=True)
+def mi_list_images_with_paths(root_folder_id: str) -> pd.DataFrame:
+    """
+    Walk root folder (recursively), return one row per image with:
+      image_name, image_link, folder_path, prompt, model_a, metadata (per-image)
+    """
+    svc = _drive_service_cached()
+    stack = [(root_folder_id, mi_get_folder_name(root_folder_id))]
+    rows = []
+
+    while stack:
+        fid, path = stack.pop()
+        page_token = None
+
+        while True:
+            resp = svc.files().list(
+                q=f"'{fid}' in parents and trashed=false",
+                fields="nextPageToken, files(id,name,mimeType)",
+                pageToken=page_token,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True
+            ).execute()
+
+            for it in resp.get("files", []):
+                f_id   = it.get("id")
+                name   = (it.get("name") or "").strip()
+                mtype  = it.get("mimeType") or ""
+
+                if mtype == "application/vnd.google-apps.folder":
+                    stack.append((f_id, f"{path}/{name}" if path else name))
+                    continue
+
+                if mtype.startswith("image/") or _has_image_ext(name):
+                    link = f"https://drive.google.com/file/d/{f_id}/view"
+                    # Per-image metadata (kept simple—your downstream grouping will stack these)
+                    meta = {
+                        "image_name": name,
+                        "image_link": link,
+                        "capability": "multi-page" if "multi-page" in name.lower() else "single-page"
+                    }
+                    rows.append({
+                        "image_name": name,
+                        "image_link": link,
+                        "folder_path": path,
+                        "prompt": ".",
+                        "model_a": ".",
+                        "metadata": json.dumps(meta, ensure_ascii=False)
+                    })
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    return pd.DataFrame(rows)
+
+def mi_build_multi_metadata(group_df: pd.DataFrame, vendorsubdomain: str, vendorlanguage: str) -> str:
+    """
+    Given all pages in a folder, build a single JSON string with
+    image_name_i / image_link_i keys (sorted by trailing number), plus static fields.
+    """
+    pages = group_df[["image_name", "image_link"]].dropna().astype(str).values.tolist()
+    pages.sort(key=lambda x: _last_number(x[0]))
+
+    meta = {}
+    for i, (nm, ln) in enumerate(pages, start=1):
+        meta[f"image_name_{i}"] = nm
+        meta[f"image_link_{i}"] = ln
+
+    meta["capability"] = "multi-page"
+    meta["vendorsubdomain"] = vendorsubdomain
+    meta["vendorlanguage"] = vendorlanguage
+    meta["tasktype"] = "OCR"  # align with your sample
+
+    return json.dumps(meta, ensure_ascii=False)
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # APP
@@ -256,7 +397,7 @@ if "mode" not in st.session_state:
     st.session_state.mode = None
     reset_counts()
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
     if st.button("📄 CSV / Excel", use_container_width=True):
         st.session_state.mode = "CSV/Excel"
@@ -272,6 +413,11 @@ with col3:
 with col4:
     if st.button("🧾 JSON file", use_container_width=True):
         st.session_state.mode = "JSON"
+        reset_counts()
+
+with col5:
+    if st.button("🖼️ Multi Image (Drive)", use_container_width=True):
+        st.session_state.mode = "Multi Image"
         reset_counts()
 
 mode = st.session_state.mode
@@ -460,6 +606,97 @@ elif mode == "JSON":
     except Exception as e:
         st.error(f"JSON parse error: {e}")
         st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODE E: Multi Image (Drive)  (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+elif mode == "Multi Image":
+    st.markdown('<div class="section-title">Scan Google Drive for Multi-Image Sets</div>', unsafe_allow_html=True)
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        folder_id = st.text_input("Root Google Drive Folder ID (images)")
+        exclude_discarded = st.checkbox("Exclude language = Discarded_Scanned", value=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if not folder_id:
+        st.stop()
+
+    try:
+        with st.spinner("Scanning Drive recursively and building multi-page groups..."):
+            per_image = mi_list_images_with_paths(folder_id)
+        if per_image.empty:
+            st.warning("No images found under this folder.")
+            st.stop()
+
+        # Derive vendorlanguage / vendorsubdomain from folder_path (same rules you showed)
+        # language = 2nd segment; vendorsubdomain = second last segment
+        def _lang_from_path(p):
+            parts = (p or "").split("/")
+            return parts[1] if len(parts) > 1 else ""
+
+        def _subdomain_from_path(p):
+            parts = (p or "").split("/")
+            return parts[-2] if len(parts) >= 2 else ""
+
+        per_image["vendorlanguage"]  = per_image["folder_path"].apply(_lang_from_path)
+        per_image["vendorsubdomain"] = per_image["folder_path"].apply(_subdomain_from_path)
+
+        # Optional filter: drop 'Discarded_Scanned'
+        if exclude_discarded:
+            per_image = per_image[per_image["vendorlanguage"].str.lower() != "discarded_scanned"]
+
+        if per_image.empty:
+            st.warning("No rows remain after filtering.")
+            st.stop()
+
+        # Normalize vendorsubdomain per your example mapping
+        per_image["vendorsubdomain"] = per_image["vendorsubdomain"].replace({"English_en_AU": "printed"}).str.lower()
+
+        # Group by folder to make one multi-image record per folder_path
+        def _build_row(group: pd.DataFrame) -> pd.Series:
+            folder_path = group["folder_path"].iloc[0]
+            lang = group["vendorlanguage"].iloc[0]
+            subd = group["vendorsubdomain"].iloc[0]
+
+            # Build the combined metadata JSON (image_name_i, image_link_i, etc.)
+            meta = mi_build_multi_metadata(group, subd, lang)
+
+            # Comma-join all image links in page order
+            order = group.copy()
+            order["_pg"] = order["image_name"].map(_last_number)
+            order = order.sort_values(["_pg", "image_name"])
+            image_joined = ",".join(order["image_link"].tolist())
+
+            return pd.Series({
+                "metadata": meta,
+                "image": image_joined,
+                "prompt": ".",
+                "model_a": ".",
+                "folder_path": folder_path,
+                "vendorsubdomain": subd,
+                "language": lang
+            })
+
+        out_df = (
+            per_image
+            .groupby("folder_path", sort=False, as_index=False)
+            .apply(_build_row)
+            .reset_index(drop=True)
+        )
+
+        st.success(f"Built {len(out_df)} multi-image record(s) from {per_image['image_name'].nunique()} images across {per_image['folder_path'].nunique()} folder(s).")
+        with st.expander("Preview multi-image output"):
+            st.dataframe(out_df.head(20), use_container_width=True)
+
+        # Hand off to the existing Output CSV Builder flow
+        base_df = out_df
+        available_fields = list(base_df.columns)
+        source_type = "multi-image"
+
+    except Exception as e:
+        st.error(f"Multi-image error: {e}")
+        st.stop()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OUTPUT CONFIG: STEP 1 — ENTER COUNTS (numbers only) (UNCHANGED)
