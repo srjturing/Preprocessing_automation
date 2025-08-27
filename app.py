@@ -3,6 +3,7 @@ import io
 import json
 import re
 import pandas as pd
+import math
 from typing import List, Dict, Tuple
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -653,45 +654,18 @@ elif mode == "Multi Image":
         per_image["vendorsubdomain"] = per_image["vendorsubdomain"].replace({"English_en_AU": "printed"}).str.lower()
 
         # Group by folder to make one multi-image record per folder_path
-        def _build_row(group: pd.DataFrame) -> pd.Series:
-            folder_path = group["folder_path"].iloc[0]
-            lang = group["vendorlanguage"].iloc[0]
-            subd = group["vendorsubdomain"].iloc[0]
-
-            # Build the combined metadata JSON (image_name_i, image_link_i, etc.)
-            meta = mi_build_multi_metadata(group, subd, lang)
-
-            # Comma-join all image links in page order
-            order = group.copy()
-            order["_pg"] = order["image_name"].map(_last_number)
-            order = order.sort_values(["_pg", "image_name"])
-            image_joined = ",".join(order["image_link"].tolist())
-
-            return pd.Series({
-                "metadata": meta,
-                "image": image_joined,
-                "prompt": ".",
-                "model_a": ".",
-                "folder_path": folder_path,
-                "vendorsubdomain": subd,
-                "language": lang
-            })
-
-        out_df = (
-            per_image
-            .groupby("folder_path", sort=False, as_index=False)
-            .apply(_build_row)
-            .reset_index(drop=True)
-        )
-
-        st.success(f"Built {len(out_df)} multi-image record(s) from {per_image['image_name'].nunique()} images across {per_image['folder_path'].nunique()} folder(s).")
-        with st.expander("Preview multi-image output"):
-            st.dataframe(out_df.head(20), use_container_width=True)
-
-        # Hand off to the existing Output CSV Builder flow
-        base_df = out_df
+        # Hand off RAW per-image rows; the new builder will do grouping & enumeration
+        base_df = per_image
         available_fields = list(base_df.columns)
         source_type = "multi-image"
+
+        st.success(
+            f"Loaded {len(base_df)} images across {base_df['folder_path'].nunique()} folder(s). "
+            "Use the Grouping section below to group by 'folder_path' (or any key)."
+        )
+        with st.expander("Preview per-image rows"):
+            st.dataframe(base_df.head(20), use_container_width=True)
+
 
     except Exception as e:
         st.error(f"Multi-image error: {e}")
@@ -699,141 +673,259 @@ elif mode == "Multi Image":
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OUTPUT CONFIG: STEP 1 — ENTER COUNTS (numbers only) (UNCHANGED)
+# NEW: Dynamic Grouping + On-the-fly Metadata/Columns with Auto-Enumeration
 # ─────────────────────────────────────────────────────────────────────────────
 st.divider()
-st.markdown("### 🧩 Configure Output Columns")
+st.markdown("### 🧩 Grouping & Output Builder (Dynamic)")
 
-if "counts_confirmed" not in st.session_state:
-    st.session_state.counts_confirmed = False
-if "n_cols" not in st.session_state:
-    st.session_state.n_cols = None
-if "meta_count" not in st.session_state:
-    st.session_state.meta_count = None
+import uuid
+import math
 
-with st.form("config_counts_form", clear_on_submit=False):
-    st.markdown('<div class="section-help">First, enter how many output columns you want and how many metadata key–value pairs to include.</div>', unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    with c1:
-        n_cols_input = st.number_input(
-            "Number of output columns (1st is always metadata)",
-            min_value=1, max_value=50, value=4, step=1, format="%d"
-        )
-    with c2:
-        meta_count_input = st.number_input(
-            "Number of metadata fields",
-            min_value=0, max_value=50, value=2, step=1, format="%d"
-        )
-    counts_submitted = st.form_submit_button("Continue")
+# Helpers
+def _first_non_null(series: pd.Series):
+    for v in series:
+        if pd.notna(v) and str(v).strip() not in {"", "."}:
+            return v
+    return ""
 
-if counts_submitted:
-    # Lock in counts; selectors will be shown next
-    st.session_state.n_cols = int(n_cols_input)
-    st.session_state.meta_count = int(meta_count_input)
-    st.session_state.counts_confirmed = True
-    st.toast("Counts confirmed. Configure fields below.", icon="✅")
+def _join_unique_comma(series: pd.Series) -> str:
+    vals = [str(v) for v in series if pd.notna(v) and str(v).strip() not in {"", "."}]
+    uniq, seen = [], set()
+    for v in vals:
+        if v not in seen:
+            uniq.append(v); seen.add(v)
+    return ",".join(uniq)
 
-# If not confirmed yet, stop here (no selectors visible)
-if not st.session_state.counts_confirmed:
-    st.stop()
+_num_suffix_re = re.compile(r"(\d+)(?!.*\d)")
+def _numeric_suffix(val: str) -> int:
+    if not isinstance(val, str): return math.inf
+    m = _num_suffix_re.search(val)
+    return int(m.group(1)) if m else math.inf
 
-n_cols = st.session_state.n_cols
-meta_count = st.session_state.meta_count
+def _snake(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^0-9a-zA-Z]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "item"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OUTPUT CONFIG: STEP 2 — FIELD SELECTIONS (UNCHANGED)
-# ─────────────────────────────────────────────────────────────────────────────
-output_colnames_fixed = [
-    "metadata",
-    "image",
-    "image_name",
-    "image_link",
-    "prompt",
-    "question",
-    "model_a",
-    "model_b",
-    "file_path",
-    "video_name",
-]
+def _enum_key(base: str, src: str, idx: int) -> str:
+    """
+    Base comes from user key; if empty, fall back to the selected source field.
+    Always snake_case and suffix with _{idx}
+    """
+    head = _snake(base or src or "item")
+    return f"{head}_{idx}"
 
-with st.form("output_config_form"):
-    st.markdown('<div class="section-help">Now choose the metadata pairs and map each output column to a source field.</div>', unsafe_allow_html=True)
+# 1) Grouping controls
+st.markdown("#### 1) Optional grouping")
+g1, g2, g3 = st.columns([2, 2, 1])
+with g1:
+    group_keys = st.multiselect("Group by (choose one or more fields)",
+                                options=available_fields, default=[])
+with g2:
+    sort_within_group_by = st.selectbox("Sort rows within group by",
+                                        options=["(none)"] + available_fields, index=0)
+with g3:
+    use_numeric_suffix = st.checkbox("Numeric suffix sort", value=True,
+                                     help="Great for page_1, page_2, …")
 
-    # Metadata pairs
-    metadata_pairs = []
-    if meta_count > 0:
-        st.markdown("**Metadata (JSON) fields**")
-        for i in range(meta_count):
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                key_name = st.text_input(f"Metadata key {i+1}", key=f"meta_key_{i}")
-            with c2:
-                src_options = ["."] + available_fields
-                value_field = st.selectbox(
-                    f"Value for key {i+1}",
-                    options=src_options,
-                    key=f"meta_val_{i}",
-                )
-            if key_name:
-                metadata_pairs.append((key_name, value_field))
+auto_enum_default = st.checkbox("Auto-enumerate metadata values when grouped", value=True)
 
-    # Columns 2..N
-    chosen_output_cols = ["metadata"]
-    chosen_sources = {"metadata": None}
+# Session state for dynamic rows
+if "meta_cfg" not in st.session_state:
+    st.session_state.meta_cfg = []  # list of dicts: {id, key, source, static, enumerate}
+if "col_cfg" not in st.session_state:
+    st.session_state.col_cfg = []   # list of dicts: {id, name, source, static, agg}
 
-    if n_cols > 1:
-        st.markdown("**Output columns**")
-        for j in range(2, n_cols + 1):
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                colname = st.selectbox(
-                    f"Name for output column #{j}",
-                    options=[x for x in output_colnames_fixed if x != "metadata"],
-                    key=f"out_col_{j}",
-                )
-            with c2:
-                src = st.selectbox(
-                    f"Data for '{colname}'",
-                    options=["."] + available_fields,
-                    key=f"out_src_{j}",
-                )
-            chosen_output_cols.append(colname)
-            chosen_sources[colname] = src
+# 2) Metadata UI (dynamic rows)
+st.markdown("#### 2) Metadata entries")
+rm_meta_ids = []
+for cfg in st.session_state.meta_cfg:
+    with st.container():
+        c1, c2, c3, c4, c5 = st.columns([1.2, 1.4, 1.4, 1.0, 0.6])
+        with c1:
+            cfg["key"] = st.text_input("Key (optional)", value=cfg.get("key",""),
+                                       key=f"meta_key_{cfg['id']}",
+                                       placeholder="leave blank to use source field name")
+        with c2:
+            cfg["source"] = st.selectbox("Value source",
+                                         options=["<STATIC>", "."] + available_fields,
+                                         index=(["<STATIC>", "."] + available_fields).index(cfg.get("source","<STATIC>"))
+                                                if cfg.get("source") in ["<STATIC>", "."] + available_fields else 0,
+                                         key=f"meta_src_{cfg['id']}")
+        with c3:
+            if cfg["source"] == "<STATIC>":
+                cfg["static"] = st.text_input("Static value", value=cfg.get("static",""),
+                                              key=f"meta_static_{cfg['id']}")
+            else:
+                st.write("\n"); st.caption("Will read per-row/group from selected field")
+                cfg["static"] = ""
+        with c4:
+            enum_suggested = bool(group_keys) and auto_enum_default and cfg["source"] not in {"<STATIC>", "."}
+            cfg["enumerate"] = st.checkbox("Enumerate", value=cfg.get("enumerate", enum_suggested),
+                                           key=f"meta_enum_{cfg['id']}",
+                                           help="Create key_1, key_2, … across grouped items")
+        with c5:
+            if st.button("🗑", key=f"meta_rm_{cfg['id']}", help="Remove this metadata row"):
+                rm_meta_ids.append(cfg["id"])
+if rm_meta_ids:
+    st.session_state.meta_cfg = [c for c in st.session_state.meta_cfg if c["id"] not in rm_meta_ids]
 
-    submitted = st.form_submit_button("Generate CSV")
+if st.button("➕ Add metadata"):
+    st.session_state.meta_cfg.append({"id": uuid.uuid4().hex[:8],
+                                      "key": "",
+                                      "source": "<STATIC>",
+                                      "static": "",
+                                      "enumerate": True})
 
-if submitted:
-    # Construct metadata JSON per row
-    def build_metadata(row: pd.Series) -> str:
-        if meta_count == 0 or len(metadata_pairs) == 0:
-            return "{}"
-        md = {}
-        for k, field in metadata_pairs:
-            md[k] = get_value(row, field)
-        try:
-            return json.dumps(md, ensure_ascii=False)
-        except Exception:
-            return json.dumps({k: str(v) for k, v in md.items()}, ensure_ascii=False)
+# Provide at least one row by default
+if not st.session_state.meta_cfg:
+    st.session_state.meta_cfg.append({"id": uuid.uuid4().hex[:8],
+                                      "key": "",
+                                      "source": "<STATIC>",
+                                      "static": "",
+                                      "enumerate": True})
 
-    out_df = pd.DataFrame()
-    out_df["metadata"] = base_df.apply(build_metadata, axis=1)
+# 3) Output columns UI (dynamic rows)
+st.markdown("#### 3) Output columns")
+rm_col_ids = []
+for cfg in st.session_state.col_cfg:
+    with st.container():
+        c1, c2, c3, c4 = st.columns([1.2, 1.4, 1.2, 0.6])
+        with c1:
+            cfg["name"] = st.text_input("Column name", value=cfg.get("name",""),
+                                        key=f"col_name_{cfg['id']}")
+        with c2:
+            cfg["source"] = st.selectbox("Value source",
+                                         options=["<STATIC>", "."] + available_fields,
+                                         index=(["<STATIC>", "."] + available_fields).index(cfg.get("source","."))
+                                                if cfg.get("source") in ["<STATIC>", "."] + available_fields else 1,
+                                         key=f"col_src_{cfg['id']}")
+        with c3:
+            if cfg["source"] == "<STATIC>":
+                cfg["static"] = st.text_input("Static value", value=cfg.get("static",""),
+                                              key=f"col_static_{cfg['id']}")
+                cfg["agg"] = "first"
+            else:
+                cfg["static"] = ""
+                if group_keys:
+                    cfg["agg"] = st.selectbox("When grouped, aggregate via",
+                                              options=["first", "join_unique_comma", "count"],
+                                              index=["first","join_unique_comma","count"].index(cfg.get("agg","first")),
+                                              key=f"col_agg_{cfg['id']}")
+                else:
+                    cfg["agg"] = "first"
+                    st.selectbox("When grouped, aggregate via",
+                                 options=["first"], index=0, key=f"col_agg_{cfg['id']}", disabled=True)
+        with c4:
+            if st.button("🗑", key=f"col_rm_{cfg['id']}", help="Remove this column"):
+                rm_col_ids.append(cfg["id"])
+if rm_col_ids:
+    st.session_state.col_cfg = [c for c in st.session_state.col_cfg if c["id"] not in rm_col_ids]
 
-    # Add other chosen columns based on mapping; default '.' when field missing
-    for name in chosen_output_cols[1:]:
-        src_field = chosen_sources.get(name)
-        if src_field is None:
-            out_df[name] = "."
+if st.button("➕ Add column"):
+    st.session_state.col_cfg.append({"id": uuid.uuid4().hex[:8],
+                                     "name": "",
+                                     "source": ".",
+                                     "static": "",
+                                     "agg": "first"})
+
+# 4) Build output
+def _order_group(df: pd.DataFrame) -> pd.DataFrame:
+    if sort_within_group_by == "(none)":
+        return df
+    if use_numeric_suffix:
+        tmp = df.copy()
+        tmp["__ord"] = tmp[sort_within_group_by].astype(str).map(_numeric_suffix)
+        tmp = tmp.sort_values(["__ord", sort_within_group_by]).drop(columns=["__ord"])
+        return tmp
+    return df.sort_values(sort_within_group_by)
+
+def _build_metadata_row(row: pd.Series) -> dict:
+    md = {}
+    for m in st.session_state.meta_cfg:
+        k, src = m.get("key",""), m.get("source",".")
+        if src == "<STATIC>":
+            base_key = _snake(k or "item")
+            md[base_key] = m.get("static","")
+        elif src in {".", None, ""}:
+            base_key = _snake(k or "item")
+            md[base_key] = "."
         else:
-            out_df[name] = base_df.apply(lambda r: get_value(r, src_field), axis=1)
+            base_key = _snake(k or src)
+            # No grouping: no enumeration, just single value
+            md[base_key] = get_value(row, src)
+    return md
 
-    st.success(f"✅ Generated {len(out_df)} rows and {out_df.shape[1]} columns.")
-    st.dataframe(out_df.head(20), use_container_width=True)
+def _build_metadata_group(gdf: pd.DataFrame) -> dict:
+    ordered = _order_group(gdf)
+    md = {}
+    for m in st.session_state.meta_cfg:
+        k, src = m.get("key",""), m.get("source",".")
+        enum = bool(m.get("enumerate", False))
+        if src == "<STATIC>":
+            base_key = _snake(k or "item")
+            md[base_key] = m.get("static","")
+            continue
+        if src in {".", None, ""}:
+            base_key = _snake(k or "item")
+            md[base_key] = "."
+            continue
+        series_vals = [get_value(r, src) for _, r in ordered.iterrows()]
+        series_vals = [v for v in series_vals if str(v).strip() not in {"", "."}]
+        if enum or (auto_enum_default and series_vals and len(series_vals) > 1):
+            # Auto-enumerate: image_name -> image_name_1, image_name_2, ...
+            for i, v in enumerate(series_vals, start=1):
+                md[_enum_key(k, src, i)] = v
+        else:
+            base_key = _snake(k or src)
+            md[base_key] = _first_non_null(ordered[src])
+    return md
+
+def _col_value_row(row: pd.Series, cfg: dict):
+    src = cfg.get("source",".")
+    if src == "<STATIC>": return cfg.get("static","")
+    if src in {".", None, ""}: return "."
+    return get_value(row, src)
+
+def _col_value_group(gdf: pd.DataFrame, cfg: dict):
+    src, agg = cfg.get("source","."), cfg.get("agg","first")
+    if src == "<STATIC>": return cfg.get("static","")
+    if src in {".", None, ""}: return "."
+    ordered = _order_group(gdf)
+    if agg == "first": return _first_non_null(ordered[src])
+    if agg == "join_unique_comma": return _join_unique_comma(ordered[src])
+    if agg == "count": return int(ordered[src].notna().sum())
+    return _first_non_null(ordered[src])
+
+if st.button("Generate CSV"):
+    out_rows = []
+    if not group_keys:
+        # One output row per base row
+        for _, row in base_df.iterrows():
+            md = _build_metadata_row(row)
+            rec = {"metadata": json.dumps(md, ensure_ascii=False)}
+            for cfg in st.session_state.col_cfg:
+                name = (cfg.get("name") or "col").strip()
+                rec[name] = _col_value_row(row, cfg)
+            out_rows.append(rec)
+    else:
+        # One output row per group
+        for _, gdf in base_df.groupby(group_keys, sort=False):
+            md = _build_metadata_group(gdf)
+            rec = {"metadata": json.dumps(md, ensure_ascii=False)}
+            for cfg in st.session_state.col_cfg:
+                name = (cfg.get("name") or "col").strip()
+                rec[name] = _col_value_group(gdf, cfg)
+            out_rows.append(rec)
+
+    out_df_new = pd.DataFrame(out_rows)
+    st.success(f"✅ Generated {len(out_df_new)} rows and {out_df_new.shape[1]} columns.")
+    st.dataframe(out_df_new.head(50), use_container_width=True)
 
     csv_buf = io.StringIO()
-    out_df.to_csv(csv_buf, index=False)
-    st.download_button(
-        "⬇️ Download CSV",
-        data=csv_buf.getvalue(),
-        file_name="output.csv",
-        mime="text/csv",
-    )
+    out_df_new.to_csv(csv_buf, index=False)
+    st.download_button("⬇️ Download CSV",
+                       data=csv_buf.getvalue(),
+                       file_name="output.csv",
+                       mime="text/csv")
