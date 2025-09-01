@@ -6,6 +6,10 @@ import pandas as pd
 from typing import List, Dict, Tuple
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import zipfile
+import httplib2
+from google_auth_httplib2 import AuthorizedHttp
+import time 
 
 # python -m streamlit run app.py
 
@@ -56,60 +60,78 @@ label, .stRadio label, .stSelectbox label, .stNumberInput label { font-weight: 6
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def authenticate_drive():
-    # Prefer cloud secrets; fall back to local file only when running locally
+    """
+    Authenticate with longer HTTP timeouts (5 minutes) and discovery cache off.
+    Uses google_auth_httplib2.AuthorizedHttp (not creds.authorize()).
+    """
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     else:
-        # Local dev fallback (put your JSON in .streamlit/secrets.toml or keep a local file)
         SERVICE_ACCOUNT_FILE = "turing-genai-ws-58339643dd3f.json"
         creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 
-    return build("drive", "v3", credentials=creds)
+    http = AuthorizedHttp(creds, http=httplib2.Http(timeout=300))  # 5-minute read timeout
+    return build("drive", "v3", http=http, cache_discovery=False)
+
 
 def list_drive_images_recursive(service, parent_id: str, current_path=None, results=None) -> List[Dict]:
-    """Recursively list images in a Drive folder tree with pagination."""
+    """Recursively list images in a Drive folder tree with robust retries & pagination."""
     if current_path is None:
         current_path = []
     if results is None:
         results = []
 
-    query = f"'{parent_id}' in parents and trashed = false"
+    query = (
+        f"'{parent_id}' in parents and trashed = false and "
+        "(mimeType = 'application/vnd.google-apps.folder' or mimeType contains 'image/')"
+    )
     page_token = None
+    max_retries = 5
+    backoff = 1.5
+
     while True:
-        resp = (
+        req = (
             service.files()
             .list(
                 q=query,
                 fields="nextPageToken, files(id, name, mimeType)",
                 pageToken=page_token,
+                pageSize=1000,              # fewer API calls
+                corpora="allDrives",
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             )
-            .execute()
         )
-        files = resp.get("files", [])
 
-        for file in files:
-            mime = file.get("mimeType", "")
+        attempt = 0
+        while True:
+            try:
+                resp = req.execute(num_retries=3)
+                break
+            except Exception:
+                attempt += 1
+                if attempt >= max_retries:
+                    raise
+                time.sleep(backoff ** attempt)
+
+        for f in resp.get("files", []):
+            mime = f.get("mimeType", "")
             if mime == "application/vnd.google-apps.folder":
-                list_drive_images_recursive(
-                    service, file["id"], current_path + [file["name"]], results
-                )
+                list_drive_images_recursive(service, f["id"], current_path + [f["name"]], results)
             elif mime.startswith("image/"):
-                results.append(
-                    {
-                        "image_name": file["name"],
-                        "image_link": f"https://drive.google.com/file/d/{file['id']}/view",
-                        "full_path": current_path + [file["name"]],
-                    }
-                )
+                results.append({
+                    "image_name": f["name"],
+                    "image_link": f"https://drive.google.com/file/d/{f['id']}/view",
+                    "full_path": current_path + [f["name"]],
+                })
 
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
 
     return results
+
 
 def build_drive_dataframe(folder_id: str) -> Tuple[pd.DataFrame, List[str]]:
     """Return (drive_df, available_fields_for_drive)."""
@@ -592,11 +614,80 @@ if submitted:
     st.success(f"✅ Generated {len(out_df)} rows and {out_df.shape[1]} columns.")
     st.dataframe(out_df.head(20), use_container_width=True)
 
-    csv_buf = io.StringIO()
-    out_df.to_csv(csv_buf, index=False)
-    st.download_button(
-        "⬇️ Download CSV",
-        data=csv_buf.getvalue(),
-        file_name="output.csv",
-        mime="text/csv",
+    # Persist output for post-submit interactions (avoid disappearing UI on rerun)
+    st.session_state["out_df"] = out_df
+    st.session_state["available_fields_for_split"] = available_fields
+    st.session_state["base_df_for_split"] = base_df
+    # Keep last selection across reruns
+    if "split_field" not in st.session_state:
+        st.session_state["split_field"] = "None"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PERSISTENT: Split & Download (shown after submit, survives reruns)
+# ─────────────────────────────────────────────────────────────────────────────
+if "out_df" in st.session_state:
+    st.markdown("#### ➗ Split & Download")
+    out_df = st.session_state["out_df"]
+    available_fields = st.session_state["available_fields_for_split"]
+    base_df = st.session_state["base_df_for_split"]
+
+    split_field = st.selectbox(
+        "Split by (choose a field from your input). If 'None', a single CSV is produced.",
+        options=["None"] + sorted(list(dict.fromkeys(available_fields))),
+        index=(0 if st.session_state.get("split_field", "None") == "None" else 0),
+        key="split_field",
     )
+
+    def _safe_name(s: str) -> str:
+        s = str(s) if s is not None else "UNSPECIFIED"
+        s = s.strip() or "UNSPECIFIED"
+        s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+        return s[:80]
+
+    if split_field == "None":
+        csv_buf = io.StringIO()
+        out_df.to_csv(csv_buf, index=False)
+        st.download_button(
+            "⬇️ Download CSV",
+            data=csv_buf.getvalue(),
+            file_name="output.csv",
+            mime="text/csv",
+            key="single_csv_dl",
+        )
+    else:
+        st.info(f"Splitting by '{split_field}'. The CSV schema remains the same; rows are filtered per group.")
+        series = base_df.get(split_field)
+        if series is None:
+            st.error("Selected split field not found in the input data.")
+        else:
+            groups = {}
+            for idx, val in series.items():
+                key_val = _safe_name(val if pd.notna(val) else "UNSPECIFIED")
+                groups.setdefault(key_val, []).append(idx)
+
+            for gval, idxs in sorted(groups.items(), key=lambda x: x[0].lower()):
+                subset = out_df.loc[idxs]
+                buf = io.StringIO()
+                subset.to_csv(buf, index=False)
+                st.download_button(
+                    f"⬇️ Download CSV — {gval} ({len(subset)} rows)",
+                    data=buf.getvalue(),
+                    file_name=f"output_{_safe_name(split_field)}_{gval}.csv",
+                    mime="text/csv",
+                    key=f"dl_{_safe_name(split_field)}_{gval}",
+                )
+
+            zip_bytes = io.BytesIO()
+            with zipfile.ZipFile(zip_bytes, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for gval, idxs in groups.items():
+                    subset = out_df.loc[idxs]
+                    csv_str = subset.to_csv(index=False)
+                    zf.writestr(f"output_{_safe_name(split_field)}_{gval}.csv", csv_str)
+            zip_bytes.seek(0)
+            st.download_button(
+                f"📦 Download ALL as ZIP ({len(groups)} files)",
+                data=zip_bytes.getvalue(),
+                file_name=f"output_by_{_safe_name(split_field)}.zip",
+                mime="application/zip",
+                key="zip_all_dl",
+            )
