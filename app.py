@@ -635,7 +635,7 @@ with st.form("output_config_form"):
             chosen_output_cols.append(colname)
             chosen_sources[colname] = src
 
-    submitted = st.form_submit_button("Generate CSV")
+    submitted = st.form_submit_button("Download CSV")
 
 
 if submitted:
@@ -760,7 +760,7 @@ if "out_df" in st.session_state:
 
     st.markdown("**Groups**")
 
-    # Render group rows: [checkbox]  [label + size]  [Generate CSV (single-click download)]
+    # Render group rows: [checkbox]  [label + size]  [Download CSV (single-click download)]
     # No bulk-select row anymore.
     selected_count = 0
     for gval, idxs in sorted(groups.items(), key=lambda x: x[0].lower()):
@@ -780,7 +780,7 @@ if "out_df" in st.session_state:
             # Single-click generate & download (no separate generate step)
             subset_csv = out_df.loc[idxs].to_csv(index=False)
             st.download_button(
-                "⬇️ Generate CSV",
+                "⬇️ Download CSV",
                 data=subset_csv,
                 file_name=f"output_{_safe_name(split_field)}_{gval}.csv",
                 mime="text/csv",
