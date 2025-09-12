@@ -74,6 +74,87 @@ def authenticate_drive():
     http = AuthorizedHttp(creds, http=httplib2.Http(timeout=300))  # 5-minute read timeout
     return build("drive", "v3", http=http, cache_discovery=False)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LEVELS EXAMPLE: pick a path and show a dialog explaining level_* columns
+# ─────────────────────────────────────────────────────────────────────────────
+def _pick_levels_example(drive_df: pd.DataFrame):
+    """Pick one 'full_path' example (prefer the deepest). Returns a list[str]."""
+    if drive_df.empty or "full_path" not in drive_df.columns:
+        return []
+    lens = drive_df["full_path"].apply(lambda p: len(p) if isinstance(p, list) else 0)
+    idx = lens.idxmax()
+    example = drive_df.at[idx, "full_path"]
+    return example if isinstance(example, list) else []
+
+def show_levels_example_dialog(levels_list):
+    if not levels_list:
+        return
+    lines = [f"Level_{i}: {part}" for i, part in enumerate(levels_list)]
+    note = "Note: The last level corresponds to the image file name."
+
+    try:
+        with st.dialog("Example: understanding `level_*` columns"):
+            st.write("Here’s how folder path parts map to the `level_*` columns:")
+            st.code("\n".join(lines))
+            st.caption(note)
+            if st.button("Got it", type="primary", key="levels_got_it"):
+                st.session_state.show_levels_modal = False
+                st.rerun()
+    except Exception:
+        st.info("Example: understanding `level_*` columns")
+        st.code("\n".join(lines))
+        st.caption(note)
+        if st.button("Dismiss", key="levels_dismiss"):
+            st.session_state.show_levels_modal = False
+            st.rerun()
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIALOG / POPUP: Drive access reminder (auto-closes on "Got it")
+# ─────────────────────────────────────────────────────────────────────────────
+def show_drive_access_dialog():
+    msg = (
+        "If you're sharing a Google Drive link, please ensure that access is granted "
+        "to the following email addresses:"
+    )
+
+    def _content():
+        st.write(msg)
+        st.code("char-automations@turing-gpt.iam.gserviceaccount.com")
+        st.code("labeling-tool-dev@turing-gpt.iam.gserviceaccount.com")
+        if st.button("Got it", type="primary", key="drive_access_got_it"):
+            st.session_state.show_access_modal = False
+            # force an immediate close of the dialog
+            try:
+                st.rerun()
+            except Exception:
+                try:
+                    st.experimental_rerun()
+                except Exception:
+                    pass
+
+    # Prefer modal dialog if available
+    try:
+        @st.dialog("Google Drive sharing reminder")
+        def _dlg():
+            _content()
+        _dlg()
+    except Exception:
+        # Fallback inline notice
+        st.info(msg)
+        st.code("char-automations@turing-gpt.iam.gserviceaccount.com")
+        st.code("labeling-tool-dev@turing-gpt.iam.gserviceaccount.com")
+        if st.button("Dismiss", key="drive_access_dismiss"):
+            st.session_state.show_access_modal = False
+            try:
+                st.rerun()
+            except Exception:
+                try:
+                    st.experimental_rerun()
+                except Exception:
+                    pass
+
 
 def list_drive_images_recursive(service, parent_id: str, current_path=None, results=None) -> List[Dict]:
     """Recursively list images in a Drive folder tree with robust retries & pagination."""
@@ -278,27 +359,53 @@ if "mode" not in st.session_state:
     st.session_state.mode = None
     reset_counts()
 
+# existing
+if "show_access_modal" not in st.session_state:
+    st.session_state.show_access_modal = False
+
+# NEW (for the Levels example dialog)
+if "show_levels_modal" not in st.session_state:
+    st.session_state.show_levels_modal = False
+if "levels_example" not in st.session_state:
+    st.session_state.levels_example = []
+if "levels_modal_seen_for" not in st.session_state:
+    st.session_state.levels_modal_seen_for = set()
+if "last_folder_id_shown" not in st.session_state:
+    st.session_state.last_folder_id_shown = None
+
+
+
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     if st.button("📄 CSV / Excel", use_container_width=True):
         st.session_state.mode = "CSV/Excel"
         reset_counts()
+        st.session_state.show_access_modal = False  # ensure hidden for this path
 with col2:
     if st.button("🗂️ Drive Folder ID", use_container_width=True):
         st.session_state.mode = "Drive Folder ID"
         reset_counts()
+        st.session_state.show_access_modal = True   # ← show popup immediately
 with col3:
     if st.button("🔗 Both (CSV + Drive)", use_container_width=True):
         st.session_state.mode = "Both (CSV + Drive)"
         reset_counts()
+        st.session_state.show_access_modal = True   # ← show popup immediately
 with col4:
     if st.button("🧾 JSON file", use_container_width=True):
         st.session_state.mode = "JSON"
         reset_counts()
+        st.session_state.show_access_modal = False
+
 
 mode = st.session_state.mode
 if not mode:
     st.stop()
+
+# Show the reminder as soon as Drive-related modes are chosen
+if st.session_state.show_access_modal and mode in ("Drive Folder ID", "Both (CSV + Drive)"):
+    show_drive_access_dialog()
+
 
 st.divider()
 
@@ -344,6 +451,23 @@ elif mode == "Drive Folder ID":
         if drive_df.empty:
             st.warning("No images found in the provided Drive folder (including subfolders).")
             st.stop()
+
+        # NEW: show one-time levels example per folder_id
+        if st.session_state.last_folder_id_shown != folder_id:
+            st.session_state.levels_example = _pick_levels_example(drive_df)
+            st.session_state.show_levels_modal = True
+            st.session_state.last_folder_id_shown = folder_id
+
+        # Only show once per folder_id
+        if folder_id not in st.session_state.levels_modal_seen_for:
+            st.session_state.levels_example = _pick_levels_example(drive_df)
+            st.session_state.show_levels_modal = True
+            st.session_state.levels_modal_seen_for.add(folder_id)
+
+        if st.session_state.show_levels_modal:
+            show_levels_example_dialog(st.session_state.levels_example)
+
+
         base_df = drive_df
         available_fields = drive_fields[:]  # level_* + image_link + path_preview + image_name
         st.success(f"Discovered {len(base_df)} images.")
@@ -352,6 +476,7 @@ elif mode == "Drive Folder ID":
     except Exception as e:
         st.error(f"Drive error: {e}")
         st.stop()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODE C: Both (CSV + Drive) (UNCHANGED)
@@ -371,7 +496,7 @@ elif mode == "Both (CSV + Drive)":
         st.info("Provide both a CSV/Excel file and a Drive Folder ID.")
         st.stop()
 
-    # Load both sources
+    # Load both sources (unchanged)
     try:
         csv_df, csv_cols = load_tabular(uploaded_file)
     except Exception as e:
@@ -390,13 +515,27 @@ elif mode == "Both (CSV + Drive)":
 
     st.success(f"CSV rows: {len(csv_df)} • Drive images: {len(drive_df)}")
 
-    # Show what keys we have on each side
     with st.expander("📄 CSV Columns"):
         st.write(csv_cols)
         st.dataframe(csv_df.head(10), use_container_width=True)
     with st.expander("🗂️ Drive Fields (paths & links)"):
         st.write(drive_fields)
         st.dataframe(drive_df[["image_name", "path_preview", "image_link"]].head(10), use_container_width=True)
+
+    # NEW: one-time levels example per folder_id (before mapping UI)
+    if st.session_state.last_folder_id_shown != folder_id:
+        st.session_state.levels_example = _pick_levels_example(drive_df)
+        st.session_state.show_levels_modal = True
+        st.session_state.last_folder_id_shown = folder_id
+
+    if folder_id not in st.session_state.levels_modal_seen_for:
+        st.session_state.levels_example = _pick_levels_example(drive_df)
+    st.session_state.show_levels_modal = True
+    st.session_state.levels_modal_seen_for.add(folder_id)
+
+    if st.session_state.show_levels_modal:
+        show_levels_example_dialog(st.session_state.levels_example)
+
 
     st.markdown("### 🔗 Choose Mapping Keys")
     st.caption("Pick one column from CSV and one field from Drive. These act as unique keys to merge.")
