@@ -123,6 +123,7 @@ def show_drive_access_dialog():
         st.write(msg)
         st.code("char-automations@turing-gpt.iam.gserviceaccount.com")
         st.code("labeling-tool-dev@turing-gpt.iam.gserviceaccount.com")
+        st.code("google-drive-access@turing-genai-ws.iam.gserviceaccount.com")
         if st.button("Got it", type="primary", key="drive_access_got_it"):
             st.session_state.show_access_modal = False
             # force an immediate close of the dialog
@@ -145,6 +146,7 @@ def show_drive_access_dialog():
         st.info(msg)
         st.code("char-automations@turing-gpt.iam.gserviceaccount.com")
         st.code("labeling-tool-dev@turing-gpt.iam.gserviceaccount.com")
+        st.code("google-drive-access@turing-genai-ws.iam.gserviceaccount.com")
         if st.button("Dismiss", key="drive_access_dismiss"):
             st.session_state.show_access_modal = False
             try:
