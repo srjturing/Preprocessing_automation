@@ -429,6 +429,17 @@ if mode == "CSV/Excel":
         available_fields = csv_cols[:]  # from CSV/Excel columns
         st.success(f"Loaded {len(base_df)} rows from the uploaded file.")
         st.dataframe(base_df.head(20), use_container_width=True)
+        # Download full table for CSV upload preview
+        _csv_buf = io.StringIO()
+        base_df.to_csv(_csv_buf, index=False)
+        st.download_button(
+            "⬇️ Download full table (CSV)",
+            data=_csv_buf.getvalue(),
+            file_name="input_preview.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_csv_preview",
+        )
         source_type = "csv"
     except Exception as e:
         st.error(f"Failed to read the uploaded file: {e}")
@@ -473,7 +484,20 @@ elif mode == "Drive Folder ID":
         base_df = drive_df
         available_fields = drive_fields[:]  # level_* + image_link + path_preview + image_name
         st.success(f"Discovered {len(base_df)} images.")
-        st.dataframe(base_df[["image_name", "path_preview", "image_link"]].head(20), use_container_width=True)
+        _display_cols = ["image_name", "path_preview", "image_link"]
+        st.dataframe(base_df[_display_cols].head(20), use_container_width=True)
+
+        # Download full table for Drive preview (as shown columns)
+        _drive_buf = io.StringIO()
+        base_df[_display_cols].to_csv(_drive_buf, index=False)
+        st.download_button(
+            "⬇️ Download full table (CSV)",
+            data=_drive_buf.getvalue(),
+            file_name="drive_preview.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_drive_preview",
+        )
         source_type = "drive"
     except Exception as e:
         st.error(f"Drive error: {e}")
@@ -586,6 +610,19 @@ elif mode == "Both (CSV + Drive)":
     with st.expander("Preview merged data"):
         st.dataframe(merged.head(20), use_container_width=True)
 
+    # Download full merged table
+    _merge_buf = io.StringIO()
+    merged.to_csv(_merge_buf, index=False)
+    st.download_button(
+        "⬇️ Download full merged table (CSV)",
+        data=_merge_buf.getvalue(),
+        file_name="merged_preview.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="dl_merged_preview",
+    )
+
+
     # Expose all fields from both sides for output configuration
     base_df = merged.drop(columns=["_join_key"])
     available_fields = list(base_df.columns)
@@ -617,6 +654,18 @@ elif mode == "JSON":
 
         st.success(f"Parsed {len(base_df)} workitems from JSON.")
         st.dataframe(base_df.head(20), use_container_width=True)
+
+        # Download full table for JSON preview
+        _base_buf = io.StringIO()
+        base_df.to_csv(_base_buf, index=False)
+        st.download_button(
+            "⬇️ Download full table (CSV)",
+            data=_base_buf.getvalue(),
+            file_name="input_preview.json.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_json_preview",
+        )
 
         with st.expander("Available fields from JSON"):
             st.write(available_fields)
